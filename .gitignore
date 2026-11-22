@@ -1,0 +1,22 @@
+
+# Python environment
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Datasets
+data/
+*.tar.gz
+
+# Model checkpoints
+*.pt
+*.pth
+*.ckpt
+
+# Large archives
+*.zip
+
+# Temporary files
+.ipynb_checkpoints/
+.DS_Store
