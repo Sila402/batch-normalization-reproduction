@@ -10,7 +10,10 @@ For layer i at training step t, on one batch (x, y):
            (W_j <- W_j - lr * G_j), layers i..k unchanged.
 
 ICS is the difference between them: ||G_i - G'_i||_2 (ideal: 0) and
-cos(G_i, G'_i) (ideal: 1). If BatchNorm worked by reducing ICS, the BN
+cos(G_i, G'_i) (ideal: 1). We also report the relative difference
+||G_i - G'_i|| / ||G_i||, which does not depend on the size of the
+gradient (the standard network has tiny gradients early in training,
+which makes its raw l2 difference look small). If BatchNorm worked by reducing ICS, the BN
 network should have a smaller l2 difference and a cosine closer to 1.
 
 No training happens here. We evaluate this at every saved snapshot
@@ -18,7 +21,11 @@ No training happens here. We evaluate this at every saved snapshot
 
 "Layer" here: each Conv2d together with its BatchNorm (if any), and each
 Linear layer. That gives 10 layers for our VGG (8 conv + 2 linear). The
-paper reports VGG layers #5 and #10 (Fig. 3a).
+paper reports VGG layers #5 and #10 (Fig. 3a), but its network is deeper
+(at least 13 layers), so its layer #10 is a conv layer in the middle of
+the network. Our layer 10 is the final classifier, so by default we plot
+conv layers 5 and 8 (our last conv layer) instead. All 10 layers are in
+the CSV.
 
 Run from the repository root:
     python -m final_reproduction.experiments.analyze_ics
@@ -71,7 +78,8 @@ def gradients(model, images, labels):
 
 
 def ics_for_batch(model, images, labels, lr):
-    """l2 difference and cosine between G_i and G'_i for every layer."""
+    """l2 difference, relative l2 difference and cosine between G_i and
+    G'_i for every layer."""
     # Work on copies: train-mode forward passes change BN running stats.
     base = copy.deepcopy(model)
     g = gradients(base, images, labels)
@@ -93,9 +101,10 @@ def ics_for_batch(model, images, labels, lr):
         g_prime = gradients(shifted, images, labels)[i]
 
         diff = (g[i] - g_prime).norm().item()
+        relative = diff / max(g[i].norm().item(), 1e-12)
         cos = nn.functional.cosine_similarity(
             g[i], g_prime, dim=0).item()
-        results.append((diff, cos))
+        results.append((diff, relative, cos))
         del shifted
     return results
 
@@ -117,10 +126,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--lr", type=float, default=0.1,
                         help="Step size of the update (training LR).")
-    parser.add_argument("--batches", type=int, default=5,
+    parser.add_argument("--batches", type=int, default=20,
                         help="Random batches averaged per snapshot.")
     parser.add_argument("--plot-layers", type=int, nargs="+",
-                        default=[5, 10])
+                        default=[5, 8])
     args = parser.parse_args()
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -155,15 +164,16 @@ def main():
                                       device=DEVICE)
                 res = ics_for_batch(model, images, labels, args.lr)
                 if sums is None:
-                    sums = [[0.0, 0.0] for _ in res]
-                for s, (d, c) in zip(sums, res):
-                    s[0] += d
-                    s[1] += c
+                    sums = [[0.0, 0.0, 0.0] for _ in res]
+                for s, values in zip(sums, res):
+                    for k, v in enumerate(values):
+                        s[k] += v
 
-            for layer, (d, c) in enumerate(sums, start=1):
+            for layer, (d, rel, c) in enumerate(sums, start=1):
                 rows.append({
                     "model": name, "step": step, "layer": layer,
                     "l2_difference": d / args.batches,
+                    "relative_l2_difference": rel / args.batches,
                     "cosine": c / args.batches,
                 })
             print(f"{name} step {step} done", flush=True)
@@ -176,9 +186,10 @@ def main():
         writer.writerows(rows)
     print("Saved:", csv_path)
 
-    # Like Fig. 3a: rows = layers, columns = l2 difference / cosine.
+    # Like Fig. 3a: rows = layers,
+    # columns = l2 difference / relative l2 difference / cosine.
     n = len(args.plot_layers)
-    fig, axes = plt.subplots(n, 2, figsize=(11, 3.6 * n), squeeze=False)
+    fig, axes = plt.subplots(n, 3, figsize=(16, 3.6 * n), squeeze=False)
     styles = {"with_bn": ("Standard + BatchNorm", "tab:blue"),
               "without_bn": ("Standard", "tab:orange")}
     for r, layer in enumerate(args.plot_layers):
@@ -188,14 +199,19 @@ def main():
             steps = [x["step"] for x in sel]
             axes[r, 0].plot(steps, [x["l2_difference"] for x in sel],
                             label=label, color=color)
-            axes[r, 1].plot(steps, [x["cosine"] for x in sel],
+            axes[r, 1].plot(steps,
+                            [x["relative_l2_difference"] for x in sel],
+                            label=label, color=color)
+            axes[r, 2].plot(steps, [x["cosine"] for x in sel],
                             label=label, color=color)
         axes[r, 0].set_title(f"Layer {layer}: l2 difference (ideal 0)")
-        axes[r, 1].set_title(f"Layer {layer}: cosine angle (ideal 1)")
+        axes[r, 1].set_title(
+            f"Layer {layer}: relative l2 difference (ideal 0)")
+        axes[r, 2].set_title(f"Layer {layer}: cosine angle (ideal 1)")
         for ax in axes[r]:
             ax.set_xlabel("Training steps")
             ax.grid(alpha=0.3)
-    axes[0, 1].legend()
+    axes[0, 2].legend()
     fig.tight_layout()
     path = OUTPUT_DIR / "ics.png"
     fig.savefig(path, dpi=200)
