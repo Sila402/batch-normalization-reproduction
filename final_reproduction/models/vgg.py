@@ -34,6 +34,10 @@ class NoisyBatchNorm2d(nn.BatchNorm2d):
         if not self.training:
             return out
 
+        return self.add_noise(out)
+
+    def add_noise(self, out):
+        """Apply one fresh sample of the noise to a BN output."""
         channels = out.shape[1]
         shape = (1, channels, 1, 1)
 
