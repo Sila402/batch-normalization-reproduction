@@ -3,9 +3,22 @@ training, with and without BatchNorm.
 
 No training happens here. For every saved snapshot (step 0, 500, ...,
 15000) we load the weights, run one fixed batch of training images
-through the network and record the activations that enter a chosen
-conv layer. We then save percentiles of those activations to a CSV and
-plot them over training steps, as in Santurkar et al. (2018), Fig. 1(c).
+through the network and record the activations of a chosen conv layer.
+We then save percentiles of those activations to a CSV and plot them
+over training steps, as in Santurkar et al. (2018), Fig. 1(c).
+
+Which tensor? The paper only says "sampled activations of a given
+layer". We use the output of the conv layer, i.e. the value *before*
+BatchNorm in the BN network and before the ReLU in the standard
+network (--point pre_bn, default). This is the distribution that BN
+receives and that "internal covariate shift" is about; the output of a
+BN layer is normalized by construction, so measuring after BN would
+look stable regardless of training. This choice is our interpretation.
+--point conv_input measures the tensor entering the conv layer instead
+(after BN/ReLU/pooling of the previous layer).
+
+We also report the fraction of "dead" channels after the ReLU of the
+same layer: channels that are exactly zero for all images and positions.
 
 Run from the repository root:
     python -m final_reproduction.experiments.analyze_activations
@@ -27,6 +40,10 @@ ROOT = Path(__file__).resolve().parents[1]
 DATA_ROOT = ROOT.parent / "data"
 RESULTS_ROOT = ROOT / "results"
 OUTPUT_DIR = RESULTS_ROOT / "figure1c"
+POINT_LABELS = {
+    "pre_bn": "conv output (before BN / ReLU)",
+    "conv_input": "conv input (after BN, ReLU, pooling)",
+}
 
 SEED = 42
 NUM_IMAGES = 1000
@@ -62,33 +79,51 @@ def load_snapshot(path, use_bn):
 
 
 @torch.no_grad()
-def layer_input(model, images, layer):
-    """Activations entering conv layer number `layer` (1-based).
+def layer_activations(model, images, layer, point):
+    """Activations of conv layer number `layer` (1-based).
 
-    The input of conv layer k is the output of the ReLU of conv layer
-    k-1 (after max pooling, if there is one in between). We capture the
-    tensor that the k-th Conv2d receives with a forward hook.
+    point = "pre_bn":     output of the k-th Conv2d (forward hook).
+    point = "conv_input": tensor entering the k-th Conv2d (pre-hook).
+
+    Also returns the fraction of channels of the k-th ReLU output that
+    are zero for every image and position ("dead" on this batch).
     """
     convs = [m for m in model.features if isinstance(m, nn.Conv2d)]
+    relus = [m for m in model.features if isinstance(m, nn.ReLU)]
     captured = {}
 
-    def hook(module, inputs):
+    def conv_output_hook(module, inputs, output):
+        captured["x"] = output.detach().flatten().cpu()
+
+    def conv_input_hook(module, inputs):
         captured["x"] = inputs[0].detach().flatten().cpu()
 
-    handle = convs[layer - 1].register_forward_pre_hook(hook)
+    def relu_hook(module, inputs, output):
+        # Channel is dead if its maximum over images and positions is 0.
+        per_channel_max = output.detach().amax(dim=(0, 2, 3))
+        captured["dead"] = (per_channel_max <= 0).float().mean().item()
+
+    if point == "pre_bn":
+        h1 = convs[layer - 1].register_forward_hook(conv_output_hook)
+    else:
+        h1 = convs[layer - 1].register_forward_pre_hook(conv_input_hook)
+    h2 = relus[layer - 1].register_forward_hook(relu_hook)
 
     # Train mode: BatchNorm uses the statistics of this batch, as it
     # does during training. The model is thrown away afterwards, so the
     # running_mean / running_var updates do not matter.
     model.train()
     model(images)
-    handle.remove()
-    return captured["x"].numpy()
+    h1.remove()
+    h2.remove()
+    return captured["x"].numpy(), captured["dead"]
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--layers", type=int, nargs="+", default=[3, 6])
+    parser.add_argument("--point", choices=list(POINT_LABELS),
+                        default="pre_bn")
     args = parser.parse_args()
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -109,17 +144,20 @@ def main():
             model = (initial_model(use_bn) if path is None
                      else load_snapshot(path, use_bn))
             for layer in args.layers:
-                acts = layer_input(model, images, layer)
+                acts, dead = layer_activations(
+                    model, images, layer, args.point)
                 values = np.percentile(acts, PERCENTILES)
                 rows.append({
-                    "model": name, "layer": layer, "step": step,
+                    "model": name, "point": args.point,
+                    "layer": layer, "step": step,
+                    "dead_channel_fraction": dead,
                     "mean": float(acts.mean()), "std": float(acts.std()),
                     **{f"p{p}": float(v) for p, v in zip(PERCENTILES, values)},
                 })
             print(f"{name} step {step} done", flush=True)
             del model
 
-    csv_path = OUTPUT_DIR / "activation_percentiles.csv"
+    csv_path = OUTPUT_DIR / f"activation_percentiles_{args.point}.csv"
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
@@ -145,13 +183,14 @@ def main():
                     label="median")
             ax.plot(steps, [x["mean"] for x in r], color="black",
                     linestyle="--", label="mean")
-            ax.set_title(f"{title}: input of conv layer {layer}")
+            ax.set_title(f"{title}: conv layer {layer}")
             ax.set_xlabel("Training steps")
             ax.grid(alpha=0.3)
         axes[0].set_ylabel("Activation value")
         axes[1].legend()
+        fig.suptitle(POINT_LABELS[args.point])
         fig.tight_layout()
-        path = OUTPUT_DIR / f"layer{layer}_input_distribution.png"
+        path = OUTPUT_DIR / f"layer{layer}_{args.point}_distribution.png"
         fig.savefig(path, dpi=200)
         plt.close(fig)
         print("Saved:", path)
