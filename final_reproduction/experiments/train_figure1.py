@@ -17,6 +17,8 @@ from final_reproduction.models.vgg import VGGA
 # CONFIGURATION
 # =========================================
 
+# SEED and LEARNING_RATE are set from the command line
+# (--seed, --lr). These are only the defaults.
 SEED = 42
 BATCH_SIZE = 128
 LEARNING_RATE = 0.1
@@ -100,14 +102,14 @@ def load_data():
     train_data = datasets.CIFAR10(
         root=str(DATA_ROOT),
         train=True,
-        download=False,
+        download=True,  # no-op if data already exists
         transform=transform,
     )
 
     test_data = datasets.CIFAR10(
         root=str(DATA_ROOT),
         train=False,
-        download=False,
+        download=True,
         transform=transform,
     )
 
@@ -200,14 +202,31 @@ def create_state(
 # TRAINING
 # =========================================
 
-def train(use_bn, max_steps, resume):
-    set_seed()
+def get_run_dir(model_name):
+    # Old runs (seed 42, LR 0.1) live in results/with_bn and
+    # results/without_bn. Keep using those folders for that exact
+    # setting so existing results and checkpoints are not touched.
+    if (
+        SEED == 42
+        and LEARNING_RATE == 0.1
+        and model_name in ("with_bn", "without_bn")
+    ):
+        return RESULTS_ROOT / model_name
 
-    model_name = (
-        "with_bn" if use_bn else "without_bn"
+    return (
+        RESULTS_ROOT
+        / "runs"
+        / f"{model_name}_lr{LEARNING_RATE}_seed{SEED}"
     )
 
-    run_dir = RESULTS_ROOT / model_name
+
+def train(model_name, max_steps, resume):
+    set_seed()
+
+    use_bn = model_name in ("with_bn", "noisy_bn")
+    noisy_bn = model_name == "noisy_bn"
+
+    run_dir = get_run_dir(model_name)
     checkpoint_dir = run_dir / "checkpoints"
 
     checkpoint_dir.mkdir(
@@ -231,10 +250,16 @@ def train(use_bn, max_steps, resume):
         "save_every": SAVE_EVERY,
     }
 
+    # Old checkpoints have no "noisy_bn" key; only add it when used
+    # so that --resume still works for the existing runs.
+    if noisy_bn:
+        config["noisy_bn"] = True
+
     train_data, test_loader = load_data()
 
     model = VGGA(
-        use_batchnorm=use_bn
+        use_batchnorm=use_bn,
+        noisy_bn=noisy_bn,
     ).to(DEVICE)
 
     optimizer = torch.optim.SGD(
@@ -408,6 +433,8 @@ def train(use_bn, max_steps, resume):
 
     print("Device:", DEVICE)
     print("Model:", model_name)
+    print("Seed:", SEED, "| LR:", LEARNING_RATE)
+    print("Results:", run_dir)
     print("Target steps:", max_steps)
 
     model.train()
@@ -630,6 +657,7 @@ if __name__ == "__main__":
         choices=[
             "with_bn",
             "without_bn",
+            "noisy_bn",
         ],
         required=True,
     )
@@ -645,7 +673,22 @@ if __name__ == "__main__":
         action="store_true",
     )
 
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+    )
+
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=0.1,
+    )
+
     args = parser.parse_args()
+
+    SEED = args.seed
+    LEARNING_RATE = args.lr
 
     if args.steps < 1:
         parser.error(
@@ -653,9 +696,7 @@ if __name__ == "__main__":
         )
 
     train(
-        use_bn=(
-            args.model == "with_bn"
-        ),
+        model_name=args.model,
         max_steps=args.steps,
         resume=args.resume,
     )

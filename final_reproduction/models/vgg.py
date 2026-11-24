@@ -3,9 +3,61 @@ import torch
 import torch.nn as nn
 
 
+class NoisyBatchNorm2d(nn.BatchNorm2d):
+    """BatchNorm2d followed by the time-varying noise of
+    Santurkar et al. (2018), Appendix A.2.1 / Algorithm 1.
+
+    At every training step, for every channel j:
+        mu_j    ~ U(-n_mu, n_mu)
+        sigma_j ~ U(1, n_sigma)
+    then, for every sample and every spatial position
+    (height and width are treated as batch dimensions):
+        m ~ U(mu_j - r_mu, mu_j + r_mu)
+        s ~ N(sigma_j, r_sigma)
+    and the output becomes s * a + m.
+
+    The noise is applied only in train mode. The paper does not say
+    whether noise is used at test time; this is our assumption.
+    """
+
+    def __init__(self, num_features, n_mu=0.5, n_sigma=1.25,
+                 r_mu=0.1, r_sigma=0.1):
+        super().__init__(num_features)
+        self.n_mu = n_mu
+        self.n_sigma = n_sigma
+        self.r_mu = r_mu
+        self.r_sigma = r_sigma
+
+    def forward(self, x):
+        out = super().forward(x)
+
+        if not self.training:
+            return out
+
+        channels = out.shape[1]
+        shape = (1, channels, 1, 1)
+
+        # Per-channel parameters, resampled at every step.
+        mu = torch.empty(shape, device=out.device).uniform_(
+            -self.n_mu, self.n_mu
+        )
+        sigma = torch.empty(shape, device=out.device).uniform_(
+            1.0, self.n_sigma
+        )
+
+        # Per-activation noise around those parameters.
+        m = mu + (torch.rand_like(out) * 2 - 1) * self.r_mu
+        s = sigma + torch.randn_like(out) * self.r_sigma
+
+        return s * out + m
+
+
 class VGGA(nn.Module):
-    def __init__(self, use_batchnorm=False):
+    def __init__(self, use_batchnorm=False, noisy_bn=False):
         super().__init__()
+
+        if noisy_bn and not use_batchnorm:
+            raise ValueError("noisy_bn requires use_batchnorm=True")
 
         # VGG11-based architecture for CIFAR-10
         configuration = [
@@ -35,7 +87,10 @@ class VGGA(nn.Module):
             )
 
             if use_batchnorm:
-                layers.append(nn.BatchNorm2d(item))
+                if noisy_bn:
+                    layers.append(NoisyBatchNorm2d(item))
+                else:
+                    layers.append(nn.BatchNorm2d(item))
 
             layers.append(nn.ReLU(inplace=True))
             in_channels = item
