@@ -202,7 +202,18 @@ def create_state(
 # TRAINING
 # =========================================
 
+# Set with --out (e.g. a Google Drive folder on Colab).
+OUT_DIR = None
+
+
 def get_run_dir(model_name):
+    run_name = f"{model_name}_lr{LEARNING_RATE}_seed{SEED}"
+
+    # On Colab, results and checkpoints go to Google Drive so that
+    # they survive a disconnected session.
+    if OUT_DIR is not None:
+        return Path(OUT_DIR) / run_name
+
     # Old runs (seed 42, LR 0.1) live in results/with_bn and
     # results/without_bn. Keep using those folders for that exact
     # setting so existing results and checkpoints are not touched.
@@ -213,11 +224,7 @@ def get_run_dir(model_name):
     ):
         return RESULTS_ROOT / model_name
 
-    return (
-        RESULTS_ROOT
-        / "runs"
-        / f"{model_name}_lr{LEARNING_RATE}_seed{SEED}"
-    )
+    return RESULTS_ROOT / "runs" / run_name
 
 
 def train(model_name, max_steps, resume):
@@ -685,8 +692,16 @@ if __name__ == "__main__":
         default=0.1,
     )
 
+    parser.add_argument(
+        "--out",
+        type=str,
+        default=None,
+        help="Folder for results and checkpoints, e.g. on Google Drive.",
+    )
+
     args = parser.parse_args()
 
+    OUT_DIR = args.out
     SEED = args.seed
     LEARNING_RATE = args.lr
 
